@@ -11,9 +11,11 @@ Endpoint:
 import argparse
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
@@ -29,6 +31,20 @@ MIME = {
 
 TASKS = {}
 LOCK = threading.Lock()
+MAX_CONCURRENT = int(os.environ.get("WORKER_CONCURRENCY", "3"))
+
+
+def cleanup_task_files(task):
+    """Hapus file video beserta folder torrent-nya (sub/junk YTS ikut terbuang)."""
+    path = task.get("path")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            return
+    folder = task.get("folder")
+    if folder and os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def download_one(task):
@@ -63,6 +79,8 @@ def download_one(task):
     target_idx, target_path, target_size = videos[0]
     task["name"] = os.path.basename(target_path)
     task["size"] = target_size
+    rel_dir = os.path.dirname(target_path)  # None kalau file di root torrent (jangan rmtree OUT_DIR!)
+    task["folder"] = os.path.join(OUT_DIR, rel_dir) if rel_dir else None
     print(f"[worker] {info.name()} -> unduh {task['name']} ({target_size/1e6:.1f} MB)", flush=True)
 
     t0 = time.time()
@@ -79,6 +97,7 @@ def download_one(task):
                 task["path"] = os.path.join(OUT_DIR, target_path)
                 task["progress"] = 1.0
                 task["status"] = "ready"
+                task["done_at"] = time.time()
                 print(f"[worker] {task['id']} siap (file target utuh): {task['path']}", flush=True)
                 return
         except (RuntimeError, IndexError):
@@ -90,27 +109,56 @@ def download_one(task):
     task["path"] = os.path.join(OUT_DIR, target_path)
     task["progress"] = 1.0
     task["status"] = "ready"
+    task["done_at"] = time.time()
     print(f"[worker] {task['id']} siap: {task['path']}", flush=True)
 
 
-def worker_loop():
+def run_task(task):
+    try:
+        download_one(task)
+    except Exception as e:  # noqa: BLE001 - laporkan semua kegagalan ke status
+        task["status"] = "error"
+        task["error"] = str(e)
+        task["done_at"] = time.time()
+        print(f"[worker] error {task['id']}: {e}", flush=True)
+
+
+def reaper_loop(max_age_sec=2 * 3600):
+    """Bersihkan task ready/error yang sudah tua (file tertinggal karena kegagalan
+    jaringan klien). ready < max_age tidak disentuh: streamtape bisa saja masih menarik."""
     while True:
-        task = None
+        time.sleep(600)
+        now = time.time()
         with LOCK:
-            for t in TASKS.values():
-                if t["status"] == "queued":
-                    t["status"] = "downloading"
-                    task = t
-                    break
-        if task:
-            try:
-                download_one(task)
-            except Exception as e:  # noqa: BLE001 - laporkan semua kegagalan ke status
-                task["status"] = "error"
-                task["error"] = str(e)
-                print(f"[worker] error {task['id']}: {e}", flush=True)
-        else:
-            time.sleep(1)
+            stale = [tid for tid, t in TASKS.items()
+                     if t["status"] in ("ready", "error") and now - t.get("done_at", now) > max_age_sec
+                     and tid not in _active_downloads()]
+        for tid in stale:
+            with LOCK:
+                t = TASKS.pop(tid, None)
+            if t:
+                cleanup_task_files(t)
+                print(f"[reaper] bersihkan task tua {tid}", flush=True)
+
+
+def _active_downloads():
+    return [t["id"] for t in TASKS.values() if t["status"] in ("queued", "downloading")]
+
+
+def worker_loop():
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+        while True:
+            task = None
+            with LOCK:
+                for t in TASKS.values():
+                    if t["status"] == "queued":
+                        t["status"] = "downloading"
+                        task = t
+                        break
+            if task:
+                pool.submit(run_task, task)
+            else:
+                time.sleep(1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -166,14 +214,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"id": tid})
         if len(parts) == 2 and parts[0] == "delete":
             with LOCK:
-                t = TASKS.pop(parts[1], None)
+                t = TASKS.get(parts[1])
             if not t:
                 return self._json(404, {"error": "task tidak ditemukan"})
-            if t.get("path"):
-                try:
-                    os.remove(t["path"])
-                except OSError:
-                    pass
+            if t["status"] in ("queued", "downloading"):
+                return self._json(409, {"error": "task masih berjalan, tunggu ready/error"})
+            with LOCK:
+                TASKS.pop(parts[1], None)
+            cleanup_task_files(t)
             return self._json(200, {"deleted": parts[1]})
         return self._json(404, {"error": "endpoint tidak dikenal"})
 
@@ -232,8 +280,10 @@ def main():
     args = ap.parse_args()
 
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=reaper_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"[worker] listening di 0.0.0.0:{args.port}, output dir {OUT_DIR}", flush=True)
+    print(f"[worker] listening di 0.0.0.0:{args.port}, output dir {OUT_DIR}, "
+          f"{MAX_CONCURRENT} unduhan paralel", flush=True)
     srv.serve_forever()
 
 
