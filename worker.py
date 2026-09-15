@@ -51,14 +51,17 @@ def download_one(task):
     os.makedirs(OUT_DIR, exist_ok=True)
     ses = lt.session()
     # batasi memori: mesin codespace cuma 8GB — cache disk & peerlist default
-    # libtorrent bisa membengkak sampai OOM saat 2-3 unduhan paralel
-    sp = lt.settings_pack()
-    sp["cache_size"] = 512                # 512 blok x 16KiB = 8MiB
-    sp["cache_expiry"] = 60
-    sp["max_queued_disk_bytes"] = 4 * 1024 * 1024
-    sp["max_peerlist_size"] = 1000
-    sp["active_downloads"] = MAX_CONCURRENT
-    ses.apply_settings(sp)
+    # libtorrent bisa membengkak sampai OOM saat 2-3 unduhan paralel.
+    # apply_settings menerima dict di binding python; kalau gagal, lanjut default.
+    try:
+        ses.apply_settings({
+            "cache_size": 512,               # 512 blok x 16KiB = 8MiB
+            "cache_expiry": 60,
+            "max_queued_disk_bytes": 4 * 1024 * 1024,
+            "max_peerlist_size": 1000,
+        })
+    except (RuntimeError, TypeError, KeyError):
+        pass
     try:
         ses.listen_on(6881, 6891)
     except RuntimeError:
