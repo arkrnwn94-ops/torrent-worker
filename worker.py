@@ -56,13 +56,14 @@ def download_one(task):
 
     info = h.get_torrent_info()
     files = [(f.path, f.size) for f in info.files()]
-    videos = [(p, s) for p, s in files if p.lower().endswith(VIDEO_EXT)]
+    videos = [(i, p, s) for i, (p, s) in enumerate(files) if p.lower().endswith(VIDEO_EXT)]
     if not videos:
         raise RuntimeError("tidak ada file video di torrent ini")
-    videos.sort(key=lambda x: -x[1])
-    task["name"] = os.path.basename(videos[0][0])
-    task["size"] = videos[0][1]
-    print(f"[worker] {info.name()} -> unduh {task['name']} ({task['size']/1e6:.1f} MB)", flush=True)
+    videos.sort(key=lambda x: -x[2])
+    target_idx, target_path, target_size = videos[0]
+    task["name"] = os.path.basename(target_path)
+    task["size"] = target_size
+    print(f"[worker] {info.name()} -> unduh {task['name']} ({target_size/1e6:.1f} MB)", flush=True)
 
     t0 = time.time()
     while not h.is_seed():
@@ -70,11 +71,23 @@ def download_one(task):
         task["progress"] = round(s.progress, 4)
         task["rate"] = round(s.download_rate, 1)
         task["peers"] = s.num_peers
+        # file target sudah utuh -> tidak perlu menunggu torrent 100% (seeder bisa hilang)
+        try:
+            if h.file_progress()[target_idx] >= target_size:
+                h.pause()
+                h.flush_cache()
+                task["path"] = os.path.join(OUT_DIR, target_path)
+                task["progress"] = 1.0
+                task["status"] = "ready"
+                print(f"[worker] {task['id']} siap (file target utuh): {task['path']}", flush=True)
+                return
+        except (RuntimeError, IndexError):
+            pass  # handle bisa invalid saat race dengan status; coba lagi di iterasi berikut
         if time.time() - t0 > task["timeout"]:
             raise TimeoutError(f"unduhan tidak selesai dalam {task['timeout']}s")
         time.sleep(3)
 
-    task["path"] = os.path.join(OUT_DIR, videos[0][0])
+    task["path"] = os.path.join(OUT_DIR, target_path)
     task["progress"] = 1.0
     task["status"] = "ready"
     print(f"[worker] {task['id']} siap: {task['path']}", flush=True)
