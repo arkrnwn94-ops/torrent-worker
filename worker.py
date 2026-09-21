@@ -11,7 +11,9 @@ Endpoint:
 import argparse
 import json
 import os
+import re
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -20,6 +22,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
 import libtorrent as lt
+
+try:
+    import vidsrc_extract  # modul resolver vidsrc.sh (satu folder dgn worker.py)
+except ImportError:
+    vidsrc_extract = None
 
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v")
 OUT_DIR = os.environ.get("WORKER_OUT_DIR", "/tmp/magnet_dl")
@@ -125,9 +132,147 @@ def download_one(task):
     print(f"[worker] {task['id']} siap: {task['path']}", flush=True)
 
 
+def download_vidsrc(task):
+    """Resolve vidsrc.sh → master.m3u8 (token IP-bound codespace) → ffmpeg mux MP4.
+    Token generate.php terikat IP pemanggil, jadi resolve WAJIB di sini (codespace),
+    bukan di klien. ffmpeg -c copy: remux TS→MP4 tanpa re-encode (cepat, hemat CPU)."""
+    if vidsrc_extract is None:
+        raise RuntimeError("modul vidsrc_extract tidak tersedia di worker")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    info = vidsrc_extract.resolve(
+        task["imdb"], task.get("mtype", "movie"),
+        task.get("season"), task.get("episode"))
+    master = info["master_url"]
+    ref = info["referer"]
+    print(f"[worker] {task['id']} vidsrc resolved: {info['origin']} "
+          f"({len(info['all_variants'])} varian)", flush=True)
+
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", task["imdb"])
+    ep = f"_s{task['season']}e{task['episode']}" if task.get("season") else ""
+    fname = f"{safe}{ep}.mp4"
+    out_path = os.path.join(OUT_DIR, fname)
+    task["name"] = fname
+    task["folder"] = None  # file langsung di OUT_DIR, jangan rmtree
+
+    # header wajib supaya CDN tak balas 401; ffmpeg pakai untuk playlist+segmen
+    hdr = f"Referer: {ref}\r\nUser-Agent: {vidsrc_extract.UA}\r\nOrigin: {ref.rstrip('/')}\r\n"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-headers", hdr,
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-i", master,
+        "-c", "copy", "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart", out_path,
+    ]
+    print(f"[worker] {task['id']} ffmpeg mux → {fname}", flush=True)
+    task["status"] = "downloading"
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    t0 = time.time()
+    last = ""
+    for line in proc.stdout:
+        last = line.strip()
+        if time.time() - t0 > task["timeout"]:
+            proc.kill()
+            raise TimeoutError(f"ffmpeg > {task['timeout']}s")
+    rc = proc.wait()
+    if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) < 100000:
+        raise RuntimeError(f"ffmpeg gagal (rc={rc}): {last}")
+    task["path"] = out_path
+    task["size"] = os.path.getsize(out_path)
+    task["progress"] = 1.0
+    task["status"] = "ready"
+    task["done_at"] = time.time()
+    print(f"[worker] {task['id']} siap: {out_path} ({task['size']/1e6:.1f} MB)", flush=True)
+
+
+SUPJAV_REF = "https://supjav.com/"
+SUPJAV_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+_RESOLVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "supjav_resolve.mjs")
+
+
+def download_supjav(task):
+    """Resolve 4 host supjav (data_links hex) DI SINI (codespace, IP sama dgn
+    yg mengunduh → token IP-bound sah), pilih server ukuran TERBESAR, unduh:
+      - hls  → ffmpeg -c copy remux varian tertinggi → MP4
+      - mp4  → unduh langsung (streamtape get_video, ikut 302 tapecontent)
+    lalu sajikan supaya Streamtape /remotedl menariknya."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    dl = json.dumps(task["data_links"])
+    cmd = ["node", _RESOLVER, dl]
+    if task.get("only"):
+        cmd.append("--only=" + task["only"])
+    print(f"[worker] {task['id']} resolve supjav ({len(task['data_links'])} host)…", flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"resolver gagal (rc={r.returncode}): {r.stderr.strip()[:300]}")
+    hasil = json.loads(r.stdout.strip().splitlines()[-1])
+    if not hasil.get("ok") or not hasil.get("pilih"):
+        raise RuntimeError(f"tidak ada server valid: {hasil.get('pesan') or hasil.get('kandidat')}")
+    pilih = hasil["pilih"]
+    task["pilih"] = {k: pilih.get(k) for k in ("server", "tipe", "bytes", "tinggi")}
+    task["kandidat"] = [{k: c.get(k) for k in ("server", "ok", "bytes", "tinggi")} for c in hasil.get("kandidat", [])]
+    print(f"[worker] {task['id']} pilih {pilih['server']} {pilih['tipe']} "
+          f"~{(pilih.get('bytes') or 0)/1e6:.0f}MB {pilih.get('tinggi')}p", flush=True)
+
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", task.get("code") or task["id"])
+    out_path = os.path.join(OUT_DIR, f"{safe}.mp4")
+    task["name"] = f"{safe}.mp4"
+    task["folder"] = None
+    task["status"] = "downloading"
+
+    if pilih["tipe"] == "hls":
+        src = pilih.get("varian") or pilih["url"]
+        hdr = f"Referer: {SUPJAV_REF}\r\nUser-Agent: {SUPJAV_UA}\r\n"
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+               "-headers", hdr,
+               "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+               "-i", src, "-c", "copy", "-bsf:a", "aac_adtstoasc",
+               "-movflags", "+faststart", out_path]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        t0, last = time.time(), ""
+        for line in proc.stdout:
+            last = line.strip()
+            if time.time() - t0 > task["timeout"]:
+                proc.kill()
+                raise TimeoutError(f"ffmpeg > {task['timeout']}s")
+        rc = proc.wait()
+        if rc != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) < 100000:
+            raise RuntimeError(f"ffmpeg gagal (rc={rc}): {last}")
+    else:  # mp4 progresif (streamtape)
+        import urllib.request
+        req = urllib.request.Request(pilih["url"], headers={"Referer": SUPJAV_REF, "User-Agent": SUPJAV_UA})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=120) as resp, open(out_path, "wb") as f:
+            ctype = resp.headers.get("content-type", "")
+            if "video" not in ctype and "octet" not in ctype:
+                raise RuntimeError(f"unduhan mp4 ditolak: {resp.status} {ctype}")
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                if time.time() - t0 > task["timeout"]:
+                    raise TimeoutError(f"unduh mp4 > {task['timeout']}s")
+        if os.path.getsize(out_path) < 100000:
+            raise RuntimeError("file mp4 terlalu kecil")
+
+    task["path"] = out_path
+    task["size"] = os.path.getsize(out_path)
+    task["progress"] = 1.0
+    task["status"] = "ready"
+    task["done_at"] = time.time()
+    print(f"[worker] {task['id']} siap: {out_path} ({task['size']/1e6:.1f} MB)", flush=True)
+
+
 def run_task(task):
     try:
-        download_one(task)
+        if task.get("kind") == "vidsrc":
+            download_vidsrc(task)
+        elif task.get("kind") == "supjav":
+            download_supjav(task)
+        else:
+            download_one(task)
     except Exception as e:  # noqa: BLE001 - laporkan semua kegagalan ke status
         task["status"] = "error"
         task["error"] = str(e)
@@ -196,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
                 t = TASKS.get(parts[1])
             if not t:
                 return self._json(404, {"error": "task tidak ditemukan"})
-            return self._json(200, {k: v for k, v in t.items() if k != "magnet"})
+            return self._json(200, {k: v for k, v in t.items() if k not in ("magnet", "data_links")})
         if len(parts) >= 2 and parts[0] == "file":
             with LOCK:
                 t = TASKS.get(parts[1])
@@ -221,6 +366,42 @@ class Handler(BaseHTTPRequestHandler):
                 TASKS[tid] = {
                     "id": tid, "magnet": magnet, "status": "queued",
                     "progress": 0.0, "timeout": int(payload.get("timeout", 7200)),
+                    "name": None, "size": None, "path": None,
+                }
+            return self._json(200, {"id": tid})
+        if parts == ["add_vidsrc"]:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                imdb = payload["imdb"]
+            except (ValueError, KeyError) as e:
+                return self._json(400, {"error": f"body tidak valid: {e}"})
+            tid = uuid.uuid4().hex[:12]
+            with LOCK:
+                TASKS[tid] = {
+                    "id": tid, "kind": "vidsrc", "status": "queued",
+                    "imdb": imdb, "mtype": payload.get("type", "movie"),
+                    "season": payload.get("season"), "episode": payload.get("episode"),
+                    "progress": 0.0, "timeout": int(payload.get("timeout", 3600)),
+                    "name": None, "size": None, "path": None,
+                }
+            return self._json(200, {"id": tid})
+        if parts == ["add_supjav"]:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                data_links = payload["data_links"]
+                if not isinstance(data_links, list) or not data_links:
+                    raise ValueError("data_links kosong")
+            except (ValueError, KeyError) as e:
+                return self._json(400, {"error": f"body tidak valid: {e}"})
+            tid = uuid.uuid4().hex[:12]
+            with LOCK:
+                TASKS[tid] = {
+                    "id": tid, "kind": "supjav", "status": "queued",
+                    "data_links": data_links, "code": payload.get("code"),
+                    "only": payload.get("only"),
+                    "progress": 0.0, "timeout": int(payload.get("timeout", 5400)),
                     "name": None, "size": None, "path": None,
                 }
             return self._json(200, {"id": tid})
