@@ -5,7 +5,8 @@
     "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" },
     "ghcr.io/devcontainers/features/node:1": { "version": "lts" }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg aria2 && pip install -r requirements.txt",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg aria2 tmux && pip install -r requirements.txt",
+  "postStartCommand": "bash -lc 'command -v tmux >/dev/null || sudo apt-get install -y tmux; tmux has-session -t w 2>/dev/null || tmux new-session -d -s w \"python3 /workspaces/torrent-worker/worker.py --port 8080 2>&1 | tee /tmp/worker.log\"'",
   "forwardPorts": [8080],
   "portsAttributes": { "8080": { "label": "worker", "visibility": "public" } }
 }
