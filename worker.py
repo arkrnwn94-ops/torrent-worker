@@ -346,10 +346,13 @@ def download_aria2(task):
     print(f"[worker] {task['id']} aria2 select #{idx} {task['name']} ({total/1e6:.1f} MB)", flush=True)
 
     # 3) unduh file terpilih saja
+    # fail-fast: kalau 300s tak ada data (torrent mati/seeder hilang) → stop, jangan
+    # gantung 2 jam ngabisin slot+quota. Hard-cap tetap dijaga loop timeout Python.
+    stall = min(300, task.get("timeout", 7200))
     cmd = ["aria2c", f"--select-file={idx}", "-d", workdir, "--seed-time=0",
-           "--bt-stop-timeout=" + str(task["timeout"]),
+           "--bt-stop-timeout=" + str(stall),
            "--max-connection-per-server=16", "--split=16", "--min-split-size=1M",
-           "--bt-max-peers=200", "--file-allocation=none", "--summary-interval=10",
+           "--bt-max-peers=300", "--file-allocation=none", "--summary-interval=10",
            "--console-log-level=warn", "--bt-remove-unselected-file=true", torrent_path]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     t0 = time.time()
