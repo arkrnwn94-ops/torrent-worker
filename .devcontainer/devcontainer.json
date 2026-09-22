@@ -5,9 +5,7 @@
     "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" },
     "ghcr.io/devcontainers/features/node:1": { "version": "lts" }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg && pip install -r requirements.txt",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y ffmpeg aria2 && pip install -r requirements.txt",
   "forwardPorts": [8080],
-  "portsAttributes": {
-    "8080": { "label": "worker", "visibility": "public" }
-  }
+  "portsAttributes": { "8080": { "label": "worker", "visibility": "public" } }
 }
