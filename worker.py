@@ -21,7 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
-import libtorrent as lt
+try:
+    import libtorrent as lt  # cuma dipakai fallback download_one (kind=libtorrent)
+except ImportError:
+    lt = None  # aria2 = jalur utama; libtorrent opsional (pip-nya sering rewel di codespace)
 
 try:
     import vidsrc_extract  # modul resolver vidsrc.sh (satu folder dgn worker.py)
@@ -77,6 +80,8 @@ def _match_file_index(files, want):
 
 
 def download_one(task):
+    if lt is None:
+        raise RuntimeError("libtorrent tak terpasang di codespace ini — pakai kind aria2 (default)")
     os.makedirs(OUT_DIR, exist_ok=True)
     ses = lt.session()
     # batasi memori: mesin codespace cuma 8GB — cache disk & peerlist default
